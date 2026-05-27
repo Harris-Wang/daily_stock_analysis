@@ -22,11 +22,7 @@ import litellm
 from json_repair import repair_json
 from litellm import Router
 
-from src.agent.llm_adapter import (
-    get_thinking_extra_body,
-    resolve_fallback_litellm_wire_models,
-    register_fallback_model_pricing,
-)
+from src.agent.llm_adapter import get_thinking_extra_body
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -34,8 +30,6 @@ from src.config import (
     get_api_keys_for_model,
     get_config,
     get_configured_llm_models,
-    normalize_litellm_temperature,
-    resolve_litellm_wire_model,
     resolve_news_window_days,
 )
 from src.llm.generation_params import apply_litellm_generation_params
@@ -47,16 +41,13 @@ from src.report_language import (
     get_no_data_text,
     get_placeholder_text,
     get_unknown_text,
-    get_chip_unavailable_text,
     infer_decision_type_from_advice,
-    is_chip_placeholder_value,
     localize_chip_health,
     localize_confidence_level,
     normalize_report_language,
 )
 from src.schemas.report_schema import AnalysisReportSchema
 from src.market_context import get_market_role, get_market_guidelines
-from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +245,12 @@ _CHIP_KEYS: tuple = ("profit_ratio", "avg_cost", "concentration", "chip_health")
 
 def _is_value_placeholder(v: Any) -> bool:
     """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
-    return is_chip_placeholder_value(v)
+    if v is None:
+        return True
+    if isinstance(v, (int, float)) and v == 0:
+        return True
+    s = str(v).strip().lower()
+    return s in ("", "n/a", "na", "数据缺失", "未知", "data unavailable", "unknown", "tbd")
 
 
 _RISK_WARNING_PLACEHOLDER_TEXTS = {
@@ -346,20 +342,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(str(v).strip())
     except (TypeError, ValueError):
         return default
-
-
-def _coerce_chip_metric(v: Any) -> Optional[float]:
-    """Convert chip metrics while preserving the distinction between missing and zero."""
-    if v is None:
-        return None
-    try:
-        numeric = float(v)
-    except (TypeError, ValueError):
-        try:
-            numeric = float(str(v).strip())
-        except (TypeError, ValueError):
-            return None
-    return None if math.isnan(numeric) else numeric
 
 
 _BULLISH_TREND_HINTS: Tuple[str, ...] = (
@@ -618,56 +600,9 @@ def _build_chip_structure_from_data(chip_data: Any, language: str = "zh") -> Dic
     }
 
 
-def _has_meaningful_chip_data(chip_data: Any) -> bool:
-    """Return True when chip data has the core metrics required for reporting."""
-    if not chip_data:
-        return False
-    if hasattr(chip_data, "avg_cost"):
-        avg_cost = _coerce_chip_metric(getattr(chip_data, "avg_cost", None))
-        concentration_90 = _coerce_chip_metric(getattr(chip_data, "concentration_90", None))
-        concentration_70 = _coerce_chip_metric(getattr(chip_data, "concentration_70", None))
-    else:
-        d = chip_data if isinstance(chip_data, dict) else {}
-        avg_cost = _coerce_chip_metric(d.get("avg_cost"))
-        concentration_90_value = d.get("concentration_90")
-        if concentration_90_value is None:
-            concentration_90_value = d.get("concentration")
-        concentration_90 = _coerce_chip_metric(concentration_90_value)
-        concentration_70 = _coerce_chip_metric(d.get("concentration_70"))
-    return (
-        avg_cost is not None
-        and avg_cost > 0
-        and (
-            (concentration_90 is not None and concentration_90 >= 0)
-            or (concentration_70 is not None and concentration_70 >= 0)
-        )
-    )
-
-
-def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) -> None:
-    if not result or not isinstance(result.dashboard, dict):
-        return
-    data_perspective = result.dashboard.get("data_perspective")
-    if not isinstance(data_perspective, dict):
-        return
-    data_perspective["chip_structure"] = {}
-    data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
-
-
-def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any) -> None:
-    """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
-    if not result:
-        return
-    language = getattr(result, "report_language", "zh")
-    if _has_meaningful_chip_data(chip_data):
-        fill_chip_structure_if_needed(result, chip_data)
-        return
-    _mark_chip_structure_unavailable(result, language)
-
-
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
     """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
-    if not result or not _has_meaningful_chip_data(chip_data):
+    if not result or not chip_data:
         return
     try:
         if not result.dashboard:
@@ -1421,9 +1356,6 @@ class AnalysisResult:
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
 
-    # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
-    fundamental_context: Optional[Dict[str, Any]] = None
-
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -2115,8 +2047,6 @@ class GeminiAnalyzer:
         router_model_names: set[str],
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
-        wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
-        register_fallback_model_pricing(wire_models)
         effective_kwargs = dict(call_kwargs)
         if use_channel_router and self._router and model in router_model_names:
             return self._router.completion(**effective_kwargs)
@@ -2649,7 +2579,6 @@ class GeminiAnalyzer:
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
                 result.report_language = report_language
-                normalize_chip_structure_availability(result, context.get("chip"))
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -2747,12 +2676,6 @@ class GeminiAnalyzer:
 | 分析日期 | {context.get('date', unknown_text)} |
 
 ---
-"""
-        prompt += format_market_phase_prompt_section(
-            context.get("market_phase_context"),
-            report_language=report_language,
-        )
-        prompt += """
 
 ## 📈 技术面数据
 
@@ -2905,19 +2828,6 @@ class GeminiAnalyzer:
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
 """
-        else:
-            chip_unavailable_text = get_chip_unavailable_text(report_language)
-            chip_instruction = (
-                "Do not fabricate profit ratio, average cost, or concentration. Mention chip data "
-                "unavailability only once in the report; do not repeat per-field no-data text in `chip_structure`."
-                if report_language == "en"
-                else "请勿编造获利比例、平均成本或集中度；报告中只说明一次筹码数据不可用，不要把“数据缺失，无法判断”逐字段重复写入 `chip_structure`。"
-            )
-            prompt += f"""
-### 筹码分布数据（效率指标）
-> {chip_unavailable_text}
-> {chip_instruction}
-"""
         
         # 添加趋势分析结果（仅隐式内建 bull_trend 默认回退保留旧口径）
         if 'trend_analysis' in context:
@@ -3018,6 +2928,18 @@ class GeminiAnalyzer:
                 news_max_age_days=getattr(prompt_config, "news_max_age_days", 3),
                 news_strategy_profile=getattr(prompt_config, "news_strategy_profile", "short"),
             )
+        # 注入韭研公社异动数据（来自 signals.db）
+        jiuyan_context = context.get("jiuyan_context", "")
+        if jiuyan_context:
+            prompt += f"""
+---
+
+## 🌿 韭研公社·异动情报（来自专业投资者社区）
+以下为韭研公社记录的该股最新异动解析与时间轴事件，请结合技术面综合判断：
+
+{jiuyan_context}
+"""
+
         prompt += """
 ---
 
@@ -3053,6 +2975,25 @@ class GeminiAnalyzer:
 """
 
         # 明确的输出要求
+        prompt += f"""
+---
+
+## 🏛️ 韭研公社逻辑归因（仅供参考）
+"""
+        # 从 context 中注入 jiuyan 数据（由 pipeline._enhance_context 提前准备）
+        jy_ctx = context.get("jiuyan_context", "")
+        if jy_ctx:
+            prompt += f"""
+{jy_ctx}
+
+> 以上数据来自韭研公社每日采集，包含当日异动解析、社群热议、题材概念等。
+> 请作为市场情绪面的参考辅助，若与基本面/技术面冲突，以技术面为主。
+"""
+        else:
+            prompt += """
+暂无韭研公社数据（可能尚未采集或当日无异动记录）。
+"""
+
         prompt += f"""
 ---
 
